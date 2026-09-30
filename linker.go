@@ -380,6 +380,20 @@ func Link(objects []Object) (*Report, error) {
 			patchStart := placement.address + relocation.Offset
 			patchEnd := patchStart + patchSize
 			imageOffset := patchStart - baseAddress
+
+			// 补丁区域不允许相交：提交时后写入的补丁会覆盖先写入的字节，
+			// 那样每条重定位报告里的 bytes_after 都无法与最终映像对应。
+			for _, existing := range patches {
+				if imageOffset < existing.imageOffset+len(existing.bytes) &&
+					existing.imageOffset < imageOffset+patchSize {
+					return nil, fmt.Errorf(
+						"%s: %s patch %s..%s overlaps object %d (%s) relocation %d patch %s..%s",
+						prefix, relocation.Type, hexAddress(patchStart), hexAddress(patchEnd),
+						existing.evidence.ObjectIndex, objectName(objects, existing.evidence.ObjectIndex),
+						existing.evidence.Index, existing.evidence.PatchStartHex, existing.evidence.PatchEndHex)
+				}
+			}
+
 			bytesBefore := hex.EncodeToString(image[imageOffset : imageOffset+patchSize])
 
 			evidence := RelocationReport{

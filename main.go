@@ -38,6 +38,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	if *imagePath != "" && *reportPath != "" {
+		same, err := samePath(*imagePath, *reportPath)
+		if err != nil {
+			return err
+		}
+		if same {
+			return fmt.Errorf("image path and report path must differ, both resolve to %q", *imagePath)
+		}
+	}
+
 	allObjects := make([]Object, 0)
 	for _, inputPath := range flags.Args() {
 		data, err := os.ReadFile(inputPath)
@@ -82,17 +92,20 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	// 映像和报告必须一起提交：先暂存全部临时文件，再逐个原子替换；
+	// 任一替换失败都会把已替换的文件回滚为原内容，避免磁盘上只剩一个已更新产物。
+	outputs := make([]outputFile, 0, 2)
 	if *imagePath != "" {
-		if err := atomicWriteFile(*imagePath, image, 0o666); err != nil {
-			return fmt.Errorf("write image: %w", err)
-		}
+		outputs = append(outputs, outputFile{path: *imagePath, data: image, label: "image"})
 	}
 	if *reportPath != "" {
-		if err := atomicWriteFile(*reportPath, encodedReport.Bytes(), 0o666); err != nil {
-			return fmt.Errorf("write report: %w", err)
-		}
+		outputs = append(outputs, outputFile{path: *reportPath, data: encodedReport.Bytes(), label: "report"})
 	}
-	if *imagePath == "" && *reportPath == "" {
+	if len(outputs) > 0 {
+		if err := atomicWriteFiles(outputs, 0o666); err != nil {
+			return err
+		}
+	} else {
 		if _, err := stdout.Write(encodedReport.Bytes()); err != nil {
 			return err
 		}
@@ -100,38 +113,133 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	if dir == "" {
-		dir = "."
+type outputFile struct {
+	path  string
+	data  []byte
+	label string
+}
+
+func samePath(a, b string) (bool, error) {
+	absoluteA, err := filepath.Abs(a)
+	if err != nil {
+		return false, err
+	}
+	absoluteB, err := filepath.Abs(b)
+	if err != nil {
+		return false, err
+	}
+	return filepath.Clean(absoluteA) == filepath.Clean(absoluteB), nil
+}
+
+// atomicWriteFiles stages every output in a temporary file first, then replaces
+// the destination paths one by one. A failure during replacement restores the
+// previously replaced destinations so callers never observe a partially
+// updated image/report pair.
+func atomicWriteFiles(outputs []outputFile, perm os.FileMode) error {
+	type staged struct {
+		output  outputFile
+		tmpPath string
 	}
 
-	file, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := file.Name()
-	cleanup := true
+	stagedFiles := make([]staged, 0, len(outputs))
+	cleanupStaged := true
 	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpPath)
+		if cleanupStaged {
+			for _, staged := range stagedFiles {
+				_ = os.Remove(staged.tmpPath)
+			}
 		}
 	}()
 
-	if _, err := file.Write(data); err != nil {
-		_ = file.Close()
-		return err
+	for _, output := range outputs {
+		dir := filepath.Dir(output.path)
+		if dir == "" {
+			dir = "."
+		}
+		if info, err := os.Stat(output.path); err == nil && info.IsDir() {
+			return fmt.Errorf("write %s: %s is a directory", output.label, output.path)
+		}
+
+		file, err := os.CreateTemp(dir, filepath.Base(output.path)+".*.tmp")
+		if err != nil {
+			return fmt.Errorf("write %s: %w", output.label, err)
+		}
+		tmpPath := file.Name()
+		if _, err := file.Write(output.data); err != nil {
+			_ = file.Close()
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("write %s: %w", output.label, err)
+		}
+		if err := file.Chmod(perm); err != nil {
+			_ = file.Close()
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("write %s: %w", output.label, err)
+		}
+		if err := file.Close(); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("write %s: %w", output.label, err)
+		}
+		stagedFiles = append(stagedFiles, staged{output: output, tmpPath: tmpPath})
 	}
-	if err := file.Chmod(perm); err != nil {
-		_ = file.Close()
-		return err
+
+	type committed struct {
+		output     outputFile
+		backupPath string
+		hadBackup  bool
 	}
-	if err := file.Close(); err != nil {
-		return err
+	committedFiles := make([]committed, 0, len(stagedFiles))
+
+	rollback := func(commitErr error) error {
+		for i := len(committedFiles) - 1; i >= 0; i-- {
+			done := committedFiles[i]
+			if done.hadBackup {
+				_ = os.Rename(done.backupPath, done.output.path)
+			} else {
+				_ = os.Remove(done.output.path)
+			}
+		}
+		return commitErr
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
+
+	for _, staged := range stagedFiles {
+		var backupPath string
+		hadBackup := false
+		if _, err := os.Stat(staged.output.path); err == nil {
+			backup, err := os.CreateTemp(filepath.Dir(staged.output.path),
+				filepath.Base(staged.output.path)+".*.bak")
+			if err != nil {
+				return rollback(fmt.Errorf("write %s: %w", staged.output.label, err))
+			}
+			backupPath = backup.Name()
+			if err := backup.Close(); err != nil {
+				_ = os.Remove(backupPath)
+				return rollback(fmt.Errorf("write %s: %w", staged.output.label, err))
+			}
+			if err := os.Rename(staged.output.path, backupPath); err != nil {
+				_ = os.Remove(backupPath)
+				return rollback(fmt.Errorf("write %s: %w", staged.output.label, err))
+			}
+			hadBackup = true
+		}
+
+		if err := os.Rename(staged.tmpPath, staged.output.path); err != nil {
+			if hadBackup {
+				_ = os.Rename(backupPath, staged.output.path)
+			}
+			return rollback(fmt.Errorf("write %s: %w", staged.output.label, err))
+		}
+		committedFiles = append(committedFiles, committed{
+			output:     staged.output,
+			backupPath: backupPath,
+			hadBackup:  hadBackup,
+		})
 	}
-	cleanup = false
+
+	for _, done := range committedFiles {
+		if done.hadBackup {
+			_ = os.Remove(done.backupPath)
+		}
+	}
+	cleanupStaged = false
 	return nil
 }

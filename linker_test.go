@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
@@ -361,7 +362,7 @@ func TestWeakGlobalKeepsFirstDefinitionWhenNoStrongExists(t *testing.T) {
 func TestRunDoesNotReplaceOutputWhenLinkFails(t *testing.T) {
 	imagePath := filepath.Join(t.TempDir(), "image.bin")
 	original := []byte("keep this image")
-	if err := atomicWriteFile(imagePath, original, 0o666); err != nil {
+	if err := atomicWriteFiles([]outputFile{{path: imagePath, data: original, label: "image"}}, 0o666); err != nil {
 		t.Fatal(err)
 	}
 
@@ -388,4 +389,168 @@ func TestRunDoesNotReplaceOutputWhenLinkFails(t *testing.T) {
 
 func readFileForTest(path string) ([]byte, error) {
 	return os.ReadFile(path)
+}
+
+func TestLinkRejectsOverlappingRelocationPatches(t *testing.T) {
+	objects := []Object{{
+		Name: "overlap.o",
+		// 8 字节 .data：两条 ABS32 分别落在偏移 0 和 2，区域相交。
+		Data: &Section{Bytes: make(ByteSlice, 8), Align: 1},
+		Symbols: []Symbol{
+			{Name: "here", Section: ".data", Offset: 0, Scope: "local"},
+		},
+		Relocations: []Relocation{
+			{Type: "ABS32", Section: ".data", Offset: 0, Symbol: "here"},
+			{Type: "ABS32", Section: ".data", Offset: 2, Symbol: "here"},
+		},
+	}}
+
+	report, err := Link(objects)
+	if err == nil || !strings.Contains(err.Error(), "overlaps") {
+		t.Fatalf("Link error = %v, want overlap error", err)
+	}
+	if report != nil {
+		t.Fatalf("report = %+v, want nil on overlap", report)
+	}
+}
+
+func TestLinkAcceptsAdjacentRelocationPatches(t *testing.T) {
+	objects := []Object{{
+		Name: "adjacent.o",
+		// 两条 PCREL16 首尾相接：0..2 和 2..4，不相交。
+		Text: &Section{Bytes: make(ByteSlice, 4), Align: 1},
+		Symbols: []Symbol{
+			{Name: "here", Section: ".text", Offset: 4, Scope: "local"},
+		},
+		Relocations: []Relocation{
+			{Type: "PCREL16", Section: ".text", Offset: 0, Symbol: "here"},
+			{Type: "PCREL16", Section: ".text", Offset: 2, Symbol: "here"},
+		},
+	}}
+
+	if _, err := Link(objects); err != nil {
+		t.Fatalf("adjacent patches must be allowed, got %v", err)
+	}
+}
+
+const validInputJSON = `{
+	"name": "ok.o",
+	"data": {"bytes": [0, 0, 0, 0], "align": 1},
+	"symbols": [{"name": "g", "section": ".data", "offset": 0, "scope": "global", "binding": "strong"}],
+	"relocations": [{"type": "ABS32", "section": ".data", "offset": 0, "symbol": "g"}]
+}`
+
+func TestRunRejectsIdenticalImageAndReportPaths(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "out.bin")
+	original := []byte("keep this image")
+	if err := atomicWriteFiles([]outputFile{{path: imagePath, data: original, label: "image"}}, 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	// 两个路径文本不同（带 "./" 段），但清理后指向同一个文件。
+	reportArg := filepath.Join(dir, ".", "out.bin")
+	err := run([]string{"-o", imagePath, "-report", reportArg},
+		strings.NewReader(validInputJSON), &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "must differ") {
+		t.Fatalf("run error = %v, want path mismatch error", err)
+	}
+
+	got, err := os.ReadFile(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("existing file changed after rejected paths: got %q", got)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout = %q, want empty", stdout.String())
+	}
+}
+
+func TestRunRollsImageBackWhenReportCommitFails(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "image.bin")
+	staleImage := []byte("stale image contents")
+	if err := os.WriteFile(imagePath, staleImage, 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	// 已存在的目录无法作为文件替换目标，映像提交后报告提交必然失败。
+	reportDir := filepath.Join(dir, "report.json")
+	if err := os.Mkdir(reportDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := run([]string{"-o", imagePath, "-report", reportDir},
+		strings.NewReader(validInputJSON), &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "write report") {
+		t.Fatalf("run error = %v, want write report error", err)
+	}
+
+	got, err := os.ReadFile(imagePath)
+	if err != nil {
+		t.Fatalf("image missing after rollback: %v", err)
+	}
+	if !bytes.Equal(got, staleImage) {
+		t.Fatalf("image after failed commit = %q, want stale %q", got, staleImage)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp") || strings.Contains(entry.Name(), ".bak") {
+			t.Fatalf("temporary file left behind: %s", entry.Name())
+		}
+	}
+}
+
+func TestRunImageAndReportStayConsistent(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "image.bin")
+	reportPath := filepath.Join(dir, "report.json")
+
+	var stdout, stderr bytes.Buffer
+	if err := run([]string{"-o", imagePath, "-report", reportPath},
+		strings.NewReader(validInputJSON), &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	image, err := os.ReadFile(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reportBytes, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var report Report
+	if err := json.Unmarshal(reportBytes, &report); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := base64.StdEncoding.DecodeString(report.ImageBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(encoded, image) {
+		t.Fatal("report image_base64 does not match the image written to disk")
+	}
+
+	// 报告里每条重定位的补丁后字节都必须与最终映像中的实际字节一致。
+	for _, relocation := range report.Relocations {
+		start := relocation.PatchStart - report.ImageBase
+		want, err := hex.DecodeString(relocation.BytesAfter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := image[start : start+len(want)]; !bytes.Equal(got, want) {
+			t.Fatalf("relocation %s bytes_after %s does not match final image %s",
+				relocation.PatchStartHex, relocation.BytesAfter, hex.EncodeToString(got))
+		}
+	}
 }
