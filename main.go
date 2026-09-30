@@ -82,16 +82,54 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	if *imagePath != "" && *reportPath != "" {
+		same, err := sameOutputPath(*imagePath, *reportPath)
+		if err != nil {
+			return err
+		}
+		if same {
+			return fmt.Errorf("image path %q and report path %q refer to the same file; choose different outputs", *imagePath, *reportPath)
+		}
+	}
+
+	// Stage every output in a temporary file first, then rename them all into
+	// place. A failure while staging any output leaves every existing file
+	// untouched, so the image and the report never diverge on disk.
+	type stagedOutput struct {
+		path    string
+		tmpPath string
+	}
+	var staged []stagedOutput
+	committed := false
+	defer func() {
+		if !committed {
+			for _, output := range staged {
+				_ = os.Remove(output.tmpPath)
+			}
+		}
+	}()
+
 	if *imagePath != "" {
-		if err := atomicWriteFile(*imagePath, image, 0o666); err != nil {
+		tmpPath, err := stageFile(*imagePath, image, 0o666)
+		if err != nil {
 			return fmt.Errorf("write image: %w", err)
 		}
+		staged = append(staged, stagedOutput{path: *imagePath, tmpPath: tmpPath})
 	}
 	if *reportPath != "" {
-		if err := atomicWriteFile(*reportPath, encodedReport.Bytes(), 0o666); err != nil {
+		tmpPath, err := stageFile(*reportPath, encodedReport.Bytes(), 0o666)
+		if err != nil {
 			return fmt.Errorf("write report: %w", err)
 		}
+		staged = append(staged, stagedOutput{path: *reportPath, tmpPath: tmpPath})
 	}
+	for _, output := range staged {
+		if err := os.Rename(output.tmpPath, output.path); err != nil {
+			return fmt.Errorf("replace %s: %w", output.path, err)
+		}
+	}
+	committed = true
+
 	if *imagePath == "" && *reportPath == "" {
 		if _, err := stdout.Write(encodedReport.Bytes()); err != nil {
 			return err
@@ -100,7 +138,31 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+// sameOutputPath reports whether two paths name the same file.
+func sameOutputPath(first, second string) (bool, error) {
+	firstAbs, err := filepath.Abs(first)
+	if err != nil {
+		return false, err
+	}
+	secondAbs, err := filepath.Abs(second)
+	if err != nil {
+		return false, err
+	}
+	if firstAbs == secondAbs {
+		return true, nil
+	}
+	// If both files already exist, also catch aliases such as hard links.
+	firstInfo, firstErr := os.Stat(firstAbs)
+	secondInfo, secondErr := os.Stat(secondAbs)
+	if firstErr == nil && secondErr == nil {
+		return os.SameFile(firstInfo, secondInfo), nil
+	}
+	return false, nil
+}
+
+// stageFile writes data to a temporary file next to path and returns the
+// temporary path. The caller is responsible for renaming or removing it.
+func stageFile(path string, data []byte, perm os.FileMode) (string, error) {
 	dir := filepath.Dir(path)
 	if dir == "" {
 		dir = "."
@@ -108,30 +170,39 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 
 	file, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
 	if err != nil {
-		return err
+		return "", err
 	}
 	tmpPath := file.Name()
-	cleanup := true
+	ok := false
 	defer func() {
-		if cleanup {
+		if !ok {
 			_ = os.Remove(tmpPath)
 		}
 	}()
 
 	if _, err := file.Write(data); err != nil {
 		_ = file.Close()
-		return err
+		return "", err
 	}
 	if err := file.Chmod(perm); err != nil {
 		_ = file.Close()
-		return err
+		return "", err
 	}
 	if err := file.Close(); err != nil {
+		return "", err
+	}
+	ok = true
+	return tmpPath, nil
+}
+
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	tmpPath, err := stageFile(path, data, perm)
+	if err != nil {
 		return err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
 		return err
 	}
-	cleanup = false
 	return nil
 }

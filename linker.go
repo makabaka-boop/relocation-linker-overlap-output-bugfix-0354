@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 )
 
 const (
@@ -442,6 +443,23 @@ func Link(objects []Object) (*Report, error) {
 		}
 	}
 
+	// 补丁区域必须两两不相交，否则后提交的补丁会覆盖先提交的字节，
+	// 报告中的补丁前后字节就无法与最终映像对应。
+	ordered := make([]plannedPatch, len(patches))
+	copy(ordered, patches)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i].imageOffset < ordered[j].imageOffset })
+	for i := 1; i < len(ordered); i++ {
+		previous := ordered[i-1]
+		current := ordered[i]
+		if current.imageOffset < previous.imageOffset+len(previous.bytes) {
+			return nil, fmt.Errorf("%s: patch range %s..%s overlaps %s: patch range %s..%s",
+				relocationLabel(objects, current.evidence),
+				hexAddress(current.evidence.PatchStart), hexAddress(current.evidence.PatchEnd),
+				relocationLabel(objects, previous.evidence),
+				hexAddress(previous.evidence.PatchStart), hexAddress(previous.evidence.PatchEnd))
+		}
+	}
+
 	// 所有输入和计算都已成功，此刻才一次性提交补丁并生成外部输出所需的数据。
 	relocationReports := make([]RelocationReport, len(patches))
 	for i, patch := range patches {
@@ -481,6 +499,11 @@ func objectName(objects []Object, index int) string {
 		return objects[index].Name
 	}
 	return fmt.Sprintf("object[%d]", index)
+}
+
+func relocationLabel(objects []Object, evidence RelocationReport) string {
+	return fmt.Sprintf("object %d (%s): relocation %d",
+		evidence.ObjectIndex, objectName(objects, evidence.ObjectIndex), evidence.Index)
 }
 
 func validAlignment(alignment int) bool {

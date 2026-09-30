@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
@@ -306,6 +307,32 @@ func TestLinkRejectsInvalidInputWithoutPartialImage(t *testing.T) {
 			wantErr: "does not fit",
 		},
 		{
+			name: "overlapping patches",
+			objects: []Object{{
+				Name:    "a.o",
+				Text:    &Section{Bytes: ByteSlice{0, 0, 0, 0}},
+				Symbols: []Symbol{{Name: "here", Section: ".text", Scope: "local"}},
+				Relocations: []Relocation{
+					{Type: "ABS32", Section: ".text", Offset: 0, Symbol: "here"},
+					{Type: "PCREL16", Section: ".text", Offset: 2, Symbol: "here"},
+				},
+			}},
+			wantErr: "overlaps",
+		},
+		{
+			name: "identical patch ranges",
+			objects: []Object{{
+				Name:    "a.o",
+				Text:    &Section{Bytes: ByteSlice{0, 0, 0, 0}},
+				Symbols: []Symbol{{Name: "here", Section: ".text", Scope: "local"}},
+				Relocations: []Relocation{
+					{Type: "ABS32", Section: ".text", Offset: 0, Symbol: "here"},
+					{Type: "ABS32", Section: ".text", Offset: 0, Symbol: "here"},
+				},
+			}},
+			wantErr: "overlaps",
+		},
+		{
 			name: "invalid alignment",
 			objects: []Object{{
 				Name: "a.o",
@@ -325,6 +352,39 @@ func TestLinkRejectsInvalidInputWithoutPartialImage(t *testing.T) {
 				t.Fatalf("report = %+v, want nil on error", report)
 			}
 		})
+	}
+}
+
+func TestLinkAdjacentPatchesMatchFinalImage(t *testing.T) {
+	objects := []Object{{
+		Name:    "a.o",
+		Text:    &Section{Bytes: make(ByteSlice, 6)},
+		Symbols: []Symbol{{Name: "here", Section: ".text", Offset: 0, Scope: "local"}},
+		Relocations: []Relocation{
+			{Type: "ABS32", Section: ".text", Offset: 0, Symbol: "here"},
+			{Type: "PCREL16", Section: ".text", Offset: 4, Symbol: "here"},
+		},
+	}}
+
+	report, err := Link(objects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ABS32 at 0x1000..0x1004 holds 0x1000; PCREL16 at 0x1004..0x1006 holds -6.
+	const expectedHex = "00100000faff"
+	image, err := base64.StdEncoding.DecodeString(report.ImageBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(image); got != expectedHex {
+		t.Fatalf("image = %s, want %s", got, expectedHex)
+	}
+	if report.Sections[0].BytesHex != expectedHex {
+		t.Fatalf("section bytes = %s, want final image %s", report.Sections[0].BytesHex, expectedHex)
+	}
+	if report.Relocations[0].BytesAfter != "00100000" || report.Relocations[1].BytesAfter != "faff" {
+		t.Fatalf("relocation bytes_after = %s, %s; want 00100000, faff",
+			report.Relocations[0].BytesAfter, report.Relocations[1].BytesAfter)
 	}
 }
 
@@ -388,4 +448,106 @@ func TestRunDoesNotReplaceOutputWhenLinkFails(t *testing.T) {
 
 func readFileForTest(path string) ([]byte, error) {
 	return os.ReadFile(path)
+}
+
+const validObjectJSON = `{
+	"name": "ok.o",
+	"text": {"bytes": [0, 0], "align": 1},
+	"symbols": [{"name": "here", "section": ".text", "offset": 0, "scope": "local"}],
+	"relocations": [{"type": "PCREL16", "section": ".text", "offset": 0, "symbol": "here"}]
+}`
+
+func TestRunWritesConsistentImageAndReport(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "image.bin")
+	reportPath := filepath.Join(dir, "report.json")
+
+	var stdout, stderr bytes.Buffer
+	if err := run([]string{"-o", imagePath, "-report", reportPath},
+		strings.NewReader(validObjectJSON), &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	image, err := os.ReadFile(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := hex.EncodeToString(image); got != "feff" {
+		t.Fatalf("image = %s, want feff", got)
+	}
+
+	reportData, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report Report
+	if err := json.Unmarshal(reportData, &report); err != nil {
+		t.Fatal(err)
+	}
+	reportImage, err := base64.StdEncoding.DecodeString(report.ImageBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reportImage, image) {
+		t.Fatalf("report image %x does not match image file %x", reportImage, image)
+	}
+	if report.Relocations[0].BytesAfter != hex.EncodeToString(image) {
+		t.Fatalf("relocation bytes_after = %s, want final image bytes %s",
+			report.Relocations[0].BytesAfter, hex.EncodeToString(image))
+	}
+}
+
+func TestRunRejectsIdenticalImageAndReportPaths(t *testing.T) {
+	dir := t.TempDir()
+	outputPath := filepath.Join(dir, "out.bin")
+	aliasedPath := filepath.Join(dir, ".", "out.bin")
+
+	for _, reportPath := range []string{outputPath, aliasedPath} {
+		var stdout, stderr bytes.Buffer
+		err := run([]string{"-o", outputPath, "-report", reportPath},
+			strings.NewReader(validObjectJSON), &stdout, &stderr)
+		if err == nil || !strings.Contains(err.Error(), "same file") {
+			t.Fatalf("run(-o %q -report %q) error = %v, want substring %q",
+				outputPath, reportPath, err, "same file")
+		}
+		if _, statErr := os.Stat(outputPath); !os.IsNotExist(statErr) {
+			t.Fatalf("output file exists after rejected run: %v", statErr)
+		}
+	}
+}
+
+func TestRunDoesNotReplaceImageWhenReportWriteFails(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "image.bin")
+	original := []byte("keep this image")
+	if err := atomicWriteFile(imagePath, original, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	reportPath := filepath.Join(dir, "missing", "report.json")
+
+	var stdout, stderr bytes.Buffer
+	err := run([]string{"-o", imagePath, "-report", reportPath},
+		strings.NewReader(validObjectJSON), &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected report write failure")
+	}
+	got, readErr := readFileForTest(imagePath)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("image file changed: got %q, want %q", got, original)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "image.bin" {
+		names := make([]string, len(entries))
+		for i, entry := range entries {
+			names[i] = entry.Name()
+		}
+		t.Fatalf("leftover files in output directory: %v", names)
+	}
 }
